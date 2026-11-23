@@ -1,0 +1,7 @@
+---
+# Deploys Posit Team: Workbench, then Connect
+- name: Posit Workbench
+  ansible.builtin.import_playbook: posit-workbench.yml
+
+- name: Posit Connect
+  ansible.builtin.import_playbook: posit-connect.yml

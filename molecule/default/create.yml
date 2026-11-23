@@ -1,0 +1,132 @@
+---
+- name: Create Proxmox VMs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pve_node: "{{ lookup('env', 'PVE_NODE') | default('pve', true) }}"
+    pve_template: ubuntu2404-tmpl
+    pve_gateway: 192.168.1.1
+    pve_dns: 192.168.1.1
+    vm_user: ansible
+    vm_ssh_pubkey: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+    vm_ssh_privkey: ~/.ssh/id_ed25519
+    molecule_inventory:
+      all:
+        children:
+          molecule:
+            hosts: {}
+  module_defaults:
+    community.proxmox.proxmox_kvm:
+      api_host: "{{ lookup('env', 'PVE_HOST') }}"
+      api_user: "{{ lookup('env', 'PVE_USER') }}"
+      api_token_id: "{{ lookup('env', 'PVE_TOKEN_ID') }}"
+      api_token_secret: "{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
+      validate_certs: false
+      node: "{{ pve_node }}"
+  tasks:
+    - name: Linked-clone VMs from template
+      community.proxmox.proxmox_kvm:
+        clone: "{{ pve_template }}"
+        name: "{{ item.name }}"
+        newid: "{{ item.vmid }}"
+        full: false
+        timeout: 300
+      loop: "{{ molecule_yml.platforms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Set CPU, memory and cloud-init
+      community.proxmox.proxmox_kvm:
+        vmid: "{{ item.vmid }}"
+        cores: "{{ item.cores }}"
+        memory: "{{ item.memory }}"
+        ciuser: "{{ vm_user }}"
+        sshkeys: "{{ vm_ssh_pubkey }}"
+        ipconfig:
+          ipconfig0: "ip={{ item.ip }}/24,gw={{ pve_gateway }}"
+        nameservers: ["{{ pve_dns }}"]
+        update: true
+      loop: "{{ molecule_yml.platforms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Start VMs
+      community.proxmox.proxmox_kvm:
+        vmid: "{{ item.vmid }}"
+        state: started
+      loop: "{{ molecule_yml.platforms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for SSH
+      ansible.builtin.wait_for:
+        host: "{{ item.ip }}"
+        port: 22
+        search_regex: OpenSSH
+        timeout: 300
+      loop: "{{ molecule_yml.platforms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Add VMs to molecule_inventory (with their groups)
+      vars:
+        inventory_partial_yaml: |
+          all:
+            children:
+              molecule:
+                hosts:
+                  {{ item.name }}:
+                    ansible_host: {{ item.ip }}
+                    ansible_user: {{ vm_user }}
+                    ansible_ssh_private_key_file: {{ vm_ssh_privkey }}
+                    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+                    ansible_become: true
+          {% for g in item.groups | default([]) %}
+              {{ g }}:
+                hosts:
+                  {{ item.name }}: {}
+          {% endfor %}
+      ansible.builtin.set_fact:
+        molecule_inventory: >-
+          {{ molecule_inventory | combine(inventory_partial_yaml | from_yaml, recursive=true) }}
+      loop: "{{ molecule_yml.platforms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Dump molecule_inventory
+      ansible.builtin.copy:
+        content: "{{ molecule_inventory | to_nice_yaml }}"
+        dest: "{{ molecule_ephemeral_directory }}/inventory/molecule_inventory.yml"
+        mode: "0600"
+
+    - name: Force inventory refresh
+      ansible.builtin.meta: refresh_inventory
+
+    - name: Fail if molecule group is missing
+      ansible.builtin.assert:
+        that: "'molecule' in groups"
+        fail_msg: "molecule group not found in inventory: {{ groups }}"
+      run_once: true  # noqa: run-once[task]
+
+- name: Validate VMs are reachable and cloud-init is done
+  hosts: molecule
+  gather_facts: false
+  tasks:
+    - name: Wait for connection
+      ansible.builtin.wait_for_connection:
+        timeout: 300
+
+    - name: Wait for cloud-init to finish (avoids apt lock errors)
+      ansible.builtin.command: cloud-init status --wait
+      register: ci_status
+      changed_when: false
+      failed_when: ci_status.rc not in [0, 2]
+
+    - name: Check uname
+      ansible.builtin.command: uname -a
+      register: uname_out
+      changed_when: false
+
+    - name: Display uname info
+      ansible.builtin.debug:
+        msg: "{{ uname_out.stdout }}"

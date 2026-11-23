@@ -1,0 +1,29 @@
+---
+driver:
+  name: default
+  options:
+    managed: true
+platforms:
+  - name: posit-workbench
+    vmid: 9101
+    ip: 192.168.1.51
+    cores: 6
+    memory: 8192
+    groups: [workbench]
+  - name: posit-connect
+    vmid: 9102
+    ip: 192.168.1.52
+    cores: 4
+    memory: 8192
+    groups: [connect]
+provisioner:
+  name: ansible
+  playbooks:
+    converge: ../../site.yml        # adjust to your playbook path
+  inventory:
+    group_vars:
+      all:
+        workbench_license_key: "${PWB_LICENSE}"
+        connect_license_key: "${PCT_LICENSE}"
+verifier:
+  name: ansible

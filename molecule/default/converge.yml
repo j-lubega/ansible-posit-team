@@ -1,0 +1,3 @@
+---
+- ansible.builtin.import_playbook: ../../posit-workbench.yml
+- ansible.builtin.import_playbook: ../../posit-connect.yml

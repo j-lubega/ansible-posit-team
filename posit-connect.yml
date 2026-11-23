@@ -1,0 +1,402 @@
+---
+# Installs the latest R, Python, Quarto, Posit Connect and Posit Professional
+# Drivers (ODBC) on an existing Ubuntu 24.04 VM.
+#
+# Run:  ansible-playbook -i inventory.ini posit-connect.yml
+#
+# Follows the Posit docs:
+#   R          https://docs.posit.co/resources/install-r/
+#   Python     https://docs.posit.co/resources/install-python-uv.html
+#   Connect    https://docs.posit.co/connect/admin/getting-started/local-install/server-install/
+#   Licensing  https://docs.posit.co/connect/admin/licensing/
+#   Quarto     https://docs.posit.co/resources/install-quarto.html
+#   ODBC       https://docs.posit.co/data-sources/admin/pro-drivers/installation.html
+
+- name: Install R, Python, Quarto and Posit Connect on Ubuntu 24.04
+  hosts: connect
+  become: true
+
+  # Asked when the playbook starts. Press Enter to skip.
+  # Skipped automatically if you pass them with -e.
+  vars_prompt:
+    - name: connect_license_key
+      prompt: "Posit Connect license key (Enter to skip)"
+      private: true
+      default: ""
+
+  vars:
+    # ---- R --------------------------------------------------------------
+    r_latest_minor_count: 2     # newest patch of the 2 newest R lines (e.g. 4.6.x + 4.5.x)
+    r_versions: []              # or pin exact versions, e.g. ["4.6.2", "4.5.3"]
+
+    # ---- Python ---------------------------------------------------------
+    python_versions: ["3.14", "3.13"]   # uv installs the newest patch of each
+
+    # ---- Connect --------------------------------------------------------
+    connect_version: latest     # or pin, e.g. "2026.11.0"
+    connect_port: 3939
+    connect_address: "http://{{ ansible_host | default(inventory_hostname) }}:{{ connect_port }}"
+    connect_package_repo: "https://packagemanager.posit.co/cran/__linux__/noble/latest"
+    connect_pypi_repo: "https://packagemanager.posit.co/pypi/latest/simple"
+
+    # ---- Quarto ---------------------------------------------------------
+    quarto_version: latest      # or pin, e.g. "1.9.38"
+
+    # ---- ODBC (Posit Professional Drivers) ------------------------------
+    install_pro_drivers: true   # SQL Server, Oracle, PostgreSQL, Snowflake, ...
+
+  handlers:
+    - name: Restart Connect
+      ansible.builtin.systemd_service:
+        name: rstudio-connect
+        state: restarted
+
+  tasks:
+    # =====================================================================
+    # Step 1 - Check the VM
+    # =====================================================================
+    - name: Confirm the VM is Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == 'Ubuntu'
+          - ansible_distribution_version == '24.04'
+        fail_msg: "This playbook targets Ubuntu 24.04. Found {{ ansible_distribution }} {{ ansible_distribution_version }}."
+
+    - name: Warn if the VM is smaller than Posit recommends (4 CPU / 8 GB RAM)
+      ansible.builtin.debug:
+        msg: "WARNING: {{ ansible_processor_vcpus }} vCPU, {{ ansible_memtotal_mb }} MB RAM."
+      when: ansible_processor_vcpus < 4 or ansible_memtotal_mb < 7500
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: [curl, ca-certificates, gnupg, python3]
+        update_cache: true
+        cache_valid_time: 3600
+
+    # =====================================================================
+    # Step 2 - R  (Posit precompiled binaries -> /opt/R/<version>)
+    # =====================================================================
+    - name: Look up the newest R versions published by Posit
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl -fsSL https://cdn.posit.co/r/versions.json | python3 -c '
+        import json, sys
+        data = json.load(sys.stdin)
+        versions = data.get("r_versions", []) if isinstance(data, dict) else data
+        releases = sorted({v for v in versions if v.count(".") == 2 and v.replace(".", "").isdigit()},
+                          key=lambda v: tuple(int(p) for p in v.split(".")))
+        newest_per_minor = {}
+        for v in reversed(releases):
+            newest_per_minor.setdefault(v.rsplit(".", 1)[0], v)
+        print(json.dumps(list(newest_per_minor.values())[: int(sys.argv[1])]))
+        ' {{ r_latest_minor_count }}
+      args:
+        executable: /bin/bash
+      register: r_lookup
+      changed_when: false
+      when: r_versions | length == 0
+
+    - name: Decide which R versions to install
+      ansible.builtin.set_fact:
+        r_install: "{{ r_versions if r_versions | length > 0 else r_lookup.stdout | from_json }}"
+
+    - name: Install R
+      ansible.builtin.apt:
+        deb: "https://cdn.posit.co/r/ubuntu-2404/pkgs/r-{{ item }}_1_{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}.deb"
+      loop: "{{ r_install }}"
+
+    - name: Make the newest R the default (R and Rscript in /usr/local/bin)
+      ansible.builtin.file:
+        src: "/opt/R/{{ r_install[0] }}/bin/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+        force: true
+      loop: [R, Rscript]
+
+    # =====================================================================
+    # Step 3 - Python  (uv -> /opt/python/<version>)
+    # =====================================================================
+    - name: Install uv
+      ansible.builtin.shell: >-
+        curl -LsSf https://astral.sh/uv/install.sh
+        | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh
+      args:
+        creates: /usr/local/bin/uv
+
+    - name: Install Python versions
+      ansible.builtin.command: >-
+        /usr/local/bin/uv python install {{ python_versions | join(' ') }}
+        --install-dir=/opt/python
+      register: uv_install
+      changed_when: "'Installed' in uv_install.stderr"
+
+    - name: Get the exact version and folder of each Python
+      ansible.builtin.shell: |
+        set -euo pipefail
+        py=$(UV_PYTHON_INSTALL_DIR=/opt/python UV_PYTHON_PREFERENCE=only-managed \
+             UV_PYTHON_DOWNLOADS=never /usr/local/bin/uv python find {{ item }})
+        "$py" -c 'import os, sys, platform; print(platform.python_version()); print(os.path.realpath(sys.base_prefix))'
+      args:
+        executable: /bin/bash
+        chdir: /
+      loop: "{{ python_versions }}"
+      register: py_info
+      changed_when: false
+
+    - name: Record Python versions
+      ansible.builtin.set_fact:
+        python_exact: "{{ py_info.results | map(attribute='stdout_lines') | map('first') | list }}"
+
+    - name: Create /opt/python/<version> links (Posit layout)
+      ansible.builtin.file:
+        src: "{{ item.stdout_lines[1] }}"
+        dest: "/opt/python/{{ item.stdout_lines[0] }}"
+        state: link
+      loop: "{{ py_info.results }}"
+      loop_control:
+        label: "{{ item.stdout_lines[0] }}"
+
+    - name: Upgrade pip and add virtualenv tooling in each Python (Connect builds content environments)
+      ansible.builtin.command: >-
+        /opt/python/{{ item }}/bin/python -m pip install --upgrade pip setuptools wheel
+        --break-system-packages --root-user-action=ignore
+      loop: "{{ python_exact }}"
+      register: pip_tools
+      changed_when: "'Successfully installed' in pip_tools.stdout"
+
+    # =====================================================================
+    # Step 4 - Quarto  (GitHub release tarball -> /opt/quarto/<version>)
+    # Ref: https://docs.posit.co/resources/install-quarto.html
+    # =====================================================================
+    - name: Look up the latest Quarto release
+      ansible.builtin.shell: |
+        set -euo pipefail
+        curl -fsSL https://api.github.com/repos/quarto-dev/quarto-cli/releases/latest \
+          | python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))'
+      args:
+        executable: /bin/bash
+      register: quarto_lookup
+      changed_when: false
+      when: quarto_version == 'latest'
+
+    - name: Decide which Quarto version to install
+      ansible.builtin.set_fact:
+        quarto_install: "{{ quarto_lookup.stdout | trim if quarto_version == 'latest' else quarto_version }}"
+        quarto_arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+
+    - name: Create the Quarto folder
+      ansible.builtin.file:
+        path: "/opt/quarto/{{ quarto_install }}"
+        state: directory
+        mode: "0755"
+
+    - name: Download and unpack Quarto
+      ansible.builtin.unarchive:
+        src: "https://github.com/quarto-dev/quarto-cli/releases/download/v{{ quarto_install }}/quarto-{{ quarto_install }}-linux-{{ quarto_arch }}.tar.gz"
+        dest: "/opt/quarto/{{ quarto_install }}"
+        remote_src: true
+        extra_opts: [--strip-components=1]
+        creates: "/opt/quarto/{{ quarto_install }}/bin/quarto"
+
+    - name: Make this Quarto the default (/usr/local/bin/quarto)
+      ansible.builtin.file:
+        src: "/opt/quarto/{{ quarto_install }}/bin/quarto"
+        dest: /usr/local/bin/quarto
+        state: link
+        force: true
+
+    - name: Verify Quarto
+      ansible.builtin.command: /opt/quarto/{{ quarto_install }}/bin/quarto check install
+      changed_when: false
+
+    # =====================================================================
+    # Step 5 - Posit Connect  (Posit package repository)
+    # =====================================================================
+    - name: Add the Posit package repository
+      ansible.builtin.deb822_repository:
+        name: posit-pro
+        types: deb
+        uris: https://dl.posit.co/public/pro/deb/ubuntu
+        suites: noble
+        components: main
+        signed_by: https://dl.posit.co/public/pro/gpg.51C0B5BB19F92D60.key
+
+    - name: Install Posit Connect
+      ansible.builtin.apt:
+        name: "{{ 'rstudio-connect' if connect_version == 'latest' else 'rstudio-connect=' ~ connect_version }}"
+        state: "{{ 'latest' if connect_version == 'latest' else 'present' }}"
+        update_cache: true
+        allow_change_held_packages: true
+      notify: Restart Connect
+
+    - name: Hold the Connect package so OS updates don't upgrade it
+      ansible.builtin.dpkg_selections:
+        name: rstudio-connect
+        selection: hold
+
+    # =====================================================================
+    # Step 6 - ODBC: Posit Professional Drivers (Posit package repository)
+    # Ref: https://docs.posit.co/data-sources/admin/pro-drivers/installation.html
+    # =====================================================================
+    - name: Install the ODBC driver manager and Posit Professional Drivers
+      ansible.builtin.apt:
+        name: [unixodbc, unixodbc-dev, rstudio-drivers]
+        state: latest
+        update_cache: true
+      when: install_pro_drivers | bool
+
+    - name: Find Oracle Instant Client folders (Ubuntu 24.04 libaio fix)
+      ansible.builtin.find:
+        paths: /usr/lib/oracle
+        patterns: "lib"
+        file_type: directory
+        recurse: true
+      register: oracle_libs
+      when: install_pro_drivers | bool
+
+    - name: Link renamed libaio for the Oracle client (Ubuntu 24.04)
+      ansible.builtin.file:
+        src: "/lib/{{ ansible_architecture }}-linux-gnu/libaio.so.1t64"
+        dest: "{{ item.path }}/libaio.so.1"
+        state: link
+      loop: "{{ oracle_libs.files | default([]) | selectattr('path', 'search', 'client64/lib$') | list }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: install_pro_drivers | bool
+
+    - name: Read the driver list shipped with the drivers
+      ansible.builtin.slurp:
+        src: /opt/rstudio-drivers/odbcinst.ini.sample
+      register: odbc_sample
+      when: install_pro_drivers | bool
+
+    - name: Register the drivers in /etc/odbcinst.ini (no duplicates on re-run)
+      ansible.builtin.blockinfile:
+        path: /etc/odbcinst.ini
+        create: true
+        backup: true
+        mode: "0644"
+        marker: "# {mark} Posit Professional Drivers (managed by Ansible)"
+        block: "{{ odbc_sample.content | b64decode }}"
+      when: install_pro_drivers | bool
+
+    # =====================================================================
+    # Step 7 - Configure Connect  (/etc/rstudio-connect/rstudio-connect.gcfg)
+    # =====================================================================
+    - name: Write the Connect configuration
+      ansible.builtin.copy:
+        dest: /etc/rstudio-connect/rstudio-connect.gcfg
+        backup: true
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          ; Managed by Ansible
+          [Server]
+          Address = "{{ connect_address }}"
+          EmailProvider = "none"
+
+          [HTTP]
+          Listen = ":{{ connect_port }}"
+
+          [Authentication]
+          Provider = "password"
+
+          [R]
+          Enabled = true
+          {% for v in r_install %}
+          Executable = "/opt/R/{{ v }}/bin/R"
+          {% endfor %}
+
+          [RPackageRepository "CRAN"]
+          URL = "{{ connect_package_repo }}"
+
+          [RPackageRepository "RSPM"]
+          URL = "{{ connect_package_repo }}"
+
+          [Python]
+          Enabled = true
+          {% for v in python_exact %}
+          Executable = "/opt/python/{{ v }}/bin/python3"
+          {% endfor %}
+
+          [Quarto]
+          Enabled = true
+          Executable = "/opt/quarto/{{ quarto_install }}/bin/quarto"
+      notify: Restart Connect
+
+    - name: Point pip at Posit Public Package Manager for Python content
+      ansible.builtin.copy:
+        dest: /etc/pip.conf
+        mode: "0644"
+        content: |
+          # Managed by Ansible
+          [global]
+          index-url = {{ connect_pypi_repo }}
+
+    - name: Check the license status
+      ansible.builtin.command: /opt/rstudio-connect/bin/license-manager status
+      register: license_status
+      changed_when: false
+      failed_when: false
+
+    - name: Activate the license
+      ansible.builtin.command: /opt/rstudio-connect/bin/license-manager activate {{ connect_license_key | quote }}
+      no_log: true
+      when:
+        - connect_license_key | length > 0
+        - "'Activated' not in license_status.stdout"
+      notify: Restart Connect
+
+    - name: Check whether the ufw firewall is on
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Open the Connect port in ufw (only if ufw is on)
+      ansible.builtin.command: ufw allow {{ connect_port }}/tcp
+      when: "'Status: active' in ufw_status.stdout"
+      changed_when: true
+
+    # =====================================================================
+    # Step 8 - Start and verify
+    # =====================================================================
+    - name: Apply restarts now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Make sure Connect starts on boot and is running
+      ansible.builtin.systemd_service:
+        name: rstudio-connect
+        state: started
+        enabled: true
+
+    - name: Check that Connect responds
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ connect_port }}/__ping__"
+        status_code: 200
+      register: ping
+      retries: 10
+      delay: 6
+      until: ping.status == 200
+
+    - name: Read installed versions
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - dpkg-query -W -f=${Version} rstudio-connect
+        - /opt/rstudio-connect/bin/license-manager status
+        - odbcinst -q -d
+      register: final
+      changed_when: false
+      failed_when: false
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Connect   : {{ final.results[0].stdout | trim }}"
+          - "R         : {{ r_install | join(', ') }} (default {{ r_install[0] }})"
+          - "Python    : {{ python_exact | join(', ') }}"
+          - "Quarto    : {{ quarto_install }} (/usr/local/bin/quarto)"
+          - "ODBC      : {{ final.results[2].stdout_lines | join(' ') if install_pro_drivers | bool else 'not installed' }}"
+          - "License   : {{ final.results[1].stdout_lines | select('search', 'Status') | first | default('see: sudo /opt/rstudio-connect/bin/license-manager status') }}"
+          - "Open      : {{ connect_address }}  (the first account you create becomes the admin)"

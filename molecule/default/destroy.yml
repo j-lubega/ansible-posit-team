@@ -1,0 +1,38 @@
+---
+- name: Destroy Proxmox VMs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    pve_node: "{{ lookup('env', 'PVE_NODE') | default('pve', true) }}"
+  module_defaults:
+    community.proxmox.proxmox_kvm:
+      api_host: "{{ lookup('env', 'PVE_HOST') }}"
+      api_user: "{{ lookup('env', 'PVE_USER') }}"
+      api_token_id: "{{ lookup('env', 'PVE_TOKEN_ID') }}"
+      api_token_secret: "{{ lookup('env', 'PVE_TOKEN_SECRET') }}"
+      validate_certs: false
+      node: "{{ pve_node }}"
+  tasks:
+    - name: Stop VMs
+      community.proxmox.proxmox_kvm:
+        vmid: "{{ item.vmid }}"
+        state: stopped
+        force: true
+        timeout: 120
+      loop: "{{ molecule_yml.platforms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      failed_when: false
+
+    - name: Delete VMs
+      community.proxmox.proxmox_kvm:
+        vmid: "{{ item.vmid }}"
+        state: absent
+      loop: "{{ molecule_yml.platforms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Remove generated inventory
+      ansible.builtin.file:
+        path: "{{ molecule_ephemeral_directory }}/inventory/molecule_inventory.yml"
+        state: absent

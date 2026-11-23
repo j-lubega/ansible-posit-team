@@ -1,0 +1,42 @@
+# ---- Secrets: never commit ----
+*.env
+!*.env.example
+.env*
+!.env.example
+*.lic
+*.pem
+*.key
+*.pub
+id_rsa*
+id_ed25519*
+vault-password*
+.vault_pass*
+secrets*.yml
+*secret*.yml
+*.tfvars
+credentials*
+proxmox_secrets*.yml
+
+# ---- Real inventories (contain your IPs / users) ----
+inventory.ini
+inventory/*.ini
+!inventory.example.ini
+hosts.ini
+
+# ---- Ansible / Molecule runtime files ----
+*.retry
+.ansible/
+.cache/
+molecule/**/.molecule/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+*.bak
+*.docker-bak
+.DS_Store
