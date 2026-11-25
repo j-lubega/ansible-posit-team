@@ -204,9 +204,17 @@ done
 az vm list-ip-addresses -g $RG -o table
 ```
 
+Note: This command assumes you already have an SSH key pair at `~/.ssh/id_ed25519.pub`. If you don't already have SSH keys configured, replace `--ssh-key-values ~/.ssh/id_ed25519.pub` with `--generate-ssh-keys`. Azure CLI will automatically generate an SSH key pair for you if one doesn't already exist.
+
 ### 6.2 Deploy
 
 Put the IPs in `inventory.ini` with `ansible_user=azureuser`, then run [section 4](#4-deploy-to-any-existing-vms-quick-start).
+
+IMPORTANT: When configuring Posit Connect as a publishing destination within Posit Workbench, you must use the private IP address of the Posit Connect VM.
+
+Use the private IP (e.g. `10.10.1.x`), not the public IP.
+
+The Workbench-to-Connect communication should take place over the Azure Virtual Network. The public IP is not the address to use for this internal connection.
 
 **Notes**
 - Restrict the NSG to your IP or VPN range. Don't expose 8787/3939 to the internet. For production,
@@ -335,13 +343,27 @@ sudo /opt/rstudio-connect/bin/license-manager status        # Connect
 ```
 
 Before production, plan for:
-- TLS (a reverse proxy or the products' built-in SSL settings)
+- TLS/SSL: HTTPS must be enabled with a trusted SSL certificate for Positron Pro and VS Code sessions to work correctly. Some IDE functionality, including web views, will not work as expected without HTTPS and a trusted certificate.
 - SSO (SAML/OIDC)
 - Posit Package Manager
 - backups of `/var/lib/rstudio-connect` and user home directories
 - monitoring
 
 See the [Posit Team documentation](https://docs.posit.co/posit-team/).
+
+### 10.1 Licence deactivation (before destroying VMs)
+
+IMPORTANT: Always deactivate your Posit licences before destroying
+the Workbench or Connect VMs. Failing to do so may leave your
+licence activation allocated to a server that no longer exists.
+
+For licence keys, run the following commands on the respective servers:
+
+Workbench:
+    `sudo rstudio-server license-manager deactivate`
+
+Connect:
+    `sudo /opt/rstudio-connect/bin/license-manager deactivate`
 
 ## 11. Troubleshooting
 
